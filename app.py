@@ -1,8 +1,8 @@
 import os
 import shutil
 import subprocess
-import tempfile
 import uuid
+import time
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file
@@ -12,28 +12,24 @@ from werkzeug.utils import secure_filename
 
 # =========================================================
 # TELUGUTECH777 PDF COMPRESSOR API
+# Strong 100 KB Target Mode
 # =========================================================
 
 app = Flask(__name__)
 
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
 MAX_UPLOAD_MB = 25
-
 MAX_CONTENT_LENGTH = MAX_UPLOAD_MB * 1024 * 1024
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
-
 BASE_FOLDER = "/tmp/pdf_compressor"
 
-os.makedirs(
-    BASE_FOLDER,
-    exist_ok=True
-)
+os.makedirs(BASE_FOLDER, exist_ok=True)
 
 
 # =========================================================
@@ -53,6 +49,7 @@ CORS(
         "X-Reduction-Percent",
         "X-Target-Reached",
         "X-Target-KB",
+        "X-Compression-Mode",
         "Content-Disposition"
     ]
 )
@@ -63,22 +60,17 @@ CORS(
 # =========================================================
 
 @app.after_request
-def add_security_headers(response):
+def security_headers(response):
 
     response.headers["X-Content-Type-Options"] = "nosniff"
-
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
-
-    response.headers["Referrer-Policy"] = (
-        "strict-origin-when-cross-origin"
-    )
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
 
     response.headers["Cache-Control"] = (
         "no-store, no-cache, must-revalidate, max-age=0"
     )
 
     response.headers["Pragma"] = "no-cache"
-
     response.headers["Expires"] = "0"
 
     return response
@@ -101,7 +93,7 @@ def home():
             "Low compression",
             "Recommended compression",
             "High compression",
-            "Target 100 KB",
+            "Strong Target 100 KB",
             "Target 200 KB",
             "Target 500 KB",
             "Target 1 MB",
@@ -111,7 +103,7 @@ def home():
 
 
 # =========================================================
-# HEALTH CHECK
+# HEALTH
 # =========================================================
 
 @app.route("/health", methods=["GET"])
@@ -129,14 +121,12 @@ def health():
 
         if result.returncode == 0:
 
-            version = result.stdout.strip()
-
             return jsonify({
                 "success": True,
                 "status": "ok",
                 "ghostscript": {
                     "installed": True,
-                    "version": version
+                    "version": result.stdout.strip()
                 }
             })
 
@@ -169,10 +159,7 @@ def file_too_large(error):
 
     return jsonify({
         "success": False,
-        "error": (
-            "File is too large. "
-            f"Maximum allowed size is {MAX_UPLOAD_MB} MB."
-        )
+        "error": f"Maximum upload size is {MAX_UPLOAD_MB} MB."
     }), 413
 
 
@@ -195,18 +182,23 @@ def internal_error(error):
 
 
 # =========================================================
-# PDF VALIDATION
+# HELPERS
 # =========================================================
+
+def get_file_size(file_path):
+
+    try:
+        return os.path.getsize(file_path)
+    except Exception:
+        return 0
+
 
 def is_pdf_file(file_path):
 
     try:
 
-        with open(file_path, "rb") as pdf_file:
-
-            header = pdf_file.read(5)
-
-            return header == b"%PDF-"
+        with open(file_path, "rb") as f:
+            return f.read(5) == b"%PDF-"
 
     except Exception:
 
@@ -214,12 +206,6 @@ def is_pdf_file(file_path):
 
 
 def validate_pdf_with_ghostscript(file_path):
-
-    """
-    Ask Ghostscript to parse the PDF.
-
-    This helps reject badly corrupted or invalid PDF files.
-    """
 
     try:
 
@@ -246,124 +232,86 @@ def validate_pdf_with_ghostscript(file_path):
 
 
 # =========================================================
-# FILE SIZE
-# =========================================================
-
-def get_file_size(file_path):
-
-    try:
-
-        return os.path.getsize(file_path)
-
-    except Exception:
-
-        return 0
-
-
-# =========================================================
 # GHOSTSCRIPT COMPRESSION
 # =========================================================
 
 def run_ghostscript(
     input_pdf,
     output_pdf,
-    dpi,
-    jpeg_quality
+    dpi=100,
+    jpeg_quality=50,
+    grayscale=False
 ):
 
     """
-    Compress PDF using Ghostscript.
+    Compress a PDF using Ghostscript.
 
-    dpi:
-        Controls image resolution.
-
-    jpeg_quality:
-        Controls JPEG image quality.
+    grayscale=True is used mainly for very aggressive
+    100 KB compression.
     """
 
     command = [
-
         "gs",
-
         "-q",
-
         "-dNOPAUSE",
-
         "-dBATCH",
-
         "-dSAFER",
 
         "-sDEVICE=pdfwrite",
-
         "-dCompatibilityLevel=1.4",
 
         "-dDetectDuplicateImages=true",
-
         "-dCompressFonts=true",
-
         "-dSubsetFonts=true",
-
         "-dEmbedAllFonts=true",
 
         "-dAutoRotatePages=/None",
 
-        # -------------------------------------------------
-        # COLOR IMAGES
-        # -------------------------------------------------
-
+        # Color images
         "-dDownsampleColorImages=true",
-
         "-dColorImageDownsampleType=/Bicubic",
-
         f"-dColorImageResolution={dpi}",
-
         "-dAutoFilterColorImages=false",
-
         "-dColorImageFilter=/DCTEncode",
 
-        f"-dJPEGQ={jpeg_quality}",
-
-        # -------------------------------------------------
-        # GRAYSCALE IMAGES
-        # -------------------------------------------------
-
+        # Grayscale images
         "-dDownsampleGrayImages=true",
-
         "-dGrayImageDownsampleType=/Bicubic",
-
         f"-dGrayImageResolution={dpi}",
-
         "-dAutoFilterGrayImages=false",
-
         "-dGrayImageFilter=/DCTEncode",
 
-        # -------------------------------------------------
-        # MONOCHROME IMAGES
-        # -------------------------------------------------
-
+        # Monochrome
         "-dDownsampleMonoImages=true",
-
         "-dMonoImageDownsampleType=/Subsample",
+        f"-dMonoImageResolution={max(dpi * 2, 50)}",
 
-        f"-dMonoImageResolution={max(dpi * 2, 72)}",
-
-        # -------------------------------------------------
-        # OUTPUT
-        # -------------------------------------------------
-
-        f"-sOutputFile={output_pdf}",
-
-        input_pdf
+        # JPEG quality
+        f"-dJPEGQ={jpeg_quality}",
     ]
 
+    # =====================================================
+    # AGGRESSIVE GRAYSCALE
+    # =====================================================
+
+    if grayscale:
+
+        command.extend([
+            "-sColorConversionStrategy=Gray",
+            "-dProcessColorModel=/DeviceGray"
+        ])
+
+    command.extend([
+        f"-sOutputFile={output_pdf}",
+        input_pdf
+    ])
 
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=180
+        timeout=90
     )
-
 
     if result.returncode != 0:
 
@@ -371,23 +319,21 @@ def run_ghostscript(
             "Ghostscript compression failed."
         )
 
-
     if not os.path.exists(output_pdf):
 
         raise RuntimeError(
-            "Compressed PDF was not created."
+            "Output PDF was not created."
         )
-
 
     if get_file_size(output_pdf) <= 0:
 
         raise RuntimeError(
-            "Compressed PDF is empty."
+            "Output PDF is empty."
         )
 
 
 # =========================================================
-# NORMAL COMPRESSION LEVELS
+# STANDARD LEVELS
 # =========================================================
 
 LEVEL_SETTINGS = {
@@ -410,208 +356,267 @@ LEVEL_SETTINGS = {
 
 
 # =========================================================
-# TARGET PROFILES
+# NORMAL TARGET PROFILES
 # =========================================================
 
-def get_target_profiles(target_kb):
-
-    """
-    Smaller requested targets receive more aggressive profiles.
-
-    The 100 KB target intentionally has additional steps.
-    """
-
-
-    # =====================================================
-    # 100 KB
-    # =====================================================
-
-    if target_kb <= 100:
-
-        return [
-
-            (160, 78),
-            (140, 72),
-            (125, 66),
-            (110, 60),
-            (100, 54),
-            (90, 48),
-            (82, 43),
-            (75, 38),
-            (68, 34),
-            (62, 30),
-            (56, 27),
-            (50, 24),
-            (46, 21),
-            (42, 18),
-            (38, 16),
-            (34, 14),
-            (30, 12),
-            (28, 10),
-            (26, 8),
-            (24, 7)
-        ]
-
-
-    # =====================================================
-    # 200 KB
-    # =====================================================
+def get_standard_profiles(target_kb):
 
     if target_kb <= 200:
 
         return [
-
-            (170, 82),
-            (150, 76),
-            (135, 70),
-            (120, 64),
-            (108, 58),
-            (96, 52),
-            (86, 46),
-            (78, 40),
-            (70, 35),
-            (62, 30),
-            (56, 27),
-            (50, 24),
-            (46, 21),
-            (42, 18),
-            (38, 16)
+            (150, 74),
+            (130, 66),
+            (115, 60),
+            (100, 54),
+            (90, 48),
+            (80, 42),
+            (70, 36),
+            (60, 30),
+            (52, 25),
+            (45, 20)
         ]
-
-
-    # =====================================================
-    # 500 KB
-    # =====================================================
 
     if target_kb <= 500:
 
         return [
-
             (180, 84),
-            (160, 80),
-            (145, 74),
-            (130, 68),
-            (115, 62),
-            (105, 57),
+            (160, 78),
+            (140, 72),
+            (125, 66),
+            (110, 60),
             (95, 52),
-            (85, 47),
-            (75, 41),
-            (68, 36),
-            (60, 31),
-            (54, 27)
+            (82, 45),
+            (70, 38),
+            (60, 32)
         ]
 
-
-    # =====================================================
-    # 1 MB OR CUSTOM LARGE TARGET
-    # =====================================================
-
     return [
-
         (200, 88),
         (180, 84),
         (160, 80),
-        (145, 75),
-        (130, 70),
-        (115, 64),
-        (100, 58),
-        (90, 52),
-        (80, 46),
-        (70, 40),
-        (60, 34),
-        (52, 28)
+        (145, 74),
+        (130, 68),
+        (115, 62),
+        (100, 56),
+        (90, 50),
+        (80, 44),
+        (70, 38),
+        (60, 32)
     ]
 
 
 # =========================================================
-# LEVEL COMPRESSION
+# SPECIAL 100 KB COMPRESSION
 # =========================================================
 
-def compress_by_level(
+def compress_to_100kb(
     input_pdf,
     job_folder,
-    level
+    target_bytes
 ):
 
-    settings = LEVEL_SETTINGS.get(level)
+    """
+    Strong 100 KB mode.
 
-    if settings is None:
+    Stage 1:
+        Normal color compression.
 
-        raise ValueError(
-            "Invalid compression level."
+    Stage 2:
+        Aggressive grayscale compression.
+
+    It stops as soon as the PDF becomes <= 100 KB.
+    """
+
+    original_size = get_file_size(input_pdf)
+
+    best_file = None
+    best_size = original_size
+
+    start_time = time.time()
+
+    # =====================================================
+    # STAGE 1 - COLOR
+    # =====================================================
+
+    color_profiles = [
+        (120, 58),
+        (100, 50),
+        (85, 42),
+        (72, 34),
+        (60, 27),
+        (50, 21),
+        (42, 17),
+        (35, 13),
+        (30, 10),
+        (25, 8)
+    ]
+
+    for index, profile in enumerate(color_profiles, start=1):
+
+        # avoid spending too long on Render
+        if time.time() - start_time > 150:
+            break
+
+        dpi, quality = profile
+
+        output_file = os.path.join(
+            job_folder,
+            f"100kb-color-{index}.pdf"
         )
 
+        try:
 
-    output_pdf = os.path.join(
+            run_ghostscript(
+                input_pdf,
+                output_file,
+                dpi=dpi,
+                jpeg_quality=quality,
+                grayscale=False
+            )
+
+        except Exception:
+
+            continue
+
+        size = get_file_size(output_file)
+
+        if size <= 0:
+            continue
+
+        if size < best_size:
+            best_size = size
+            best_file = output_file
+
+        # SUCCESS
+        if size <= target_bytes:
+
+            final_file = os.path.join(
+                job_folder,
+                "compressed-target.pdf"
+            )
+
+            shutil.copy2(
+                output_file,
+                final_file
+            )
+
+            return final_file, True, "color"
+
+
+    # =====================================================
+    # STAGE 2 - GRAYSCALE
+    # =====================================================
+
+    grayscale_profiles = [
+        (72, 38),
+        (60, 32),
+        (52, 27),
+        (45, 22),
+        (38, 18),
+        (32, 14),
+        (28, 11),
+        (24, 9),
+        (20, 7),
+        (18, 5)
+    ]
+
+    for index, profile in enumerate(
+        grayscale_profiles,
+        start=1
+    ):
+
+        if time.time() - start_time > 175:
+            break
+
+        dpi, quality = profile
+
+        output_file = os.path.join(
+            job_folder,
+            f"100kb-gray-{index}.pdf"
+        )
+
+        try:
+
+            run_ghostscript(
+                input_pdf,
+                output_file,
+                dpi=dpi,
+                jpeg_quality=quality,
+                grayscale=True
+            )
+
+        except Exception:
+
+            continue
+
+        size = get_file_size(output_file)
+
+        if size <= 0:
+            continue
+
+        if size < best_size:
+
+            best_size = size
+            best_file = output_file
+
+        # SUCCESS
+        if size <= target_bytes:
+
+            final_file = os.path.join(
+                job_folder,
+                "compressed-target.pdf"
+            )
+
+            shutil.copy2(
+                output_file,
+                final_file
+            )
+
+            return final_file, True, "grayscale"
+
+
+    # =====================================================
+    # 100 KB NOT REACHED
+    # Return smallest version
+    # =====================================================
+
+    final_file = os.path.join(
         job_folder,
-        f"compressed-{level}.pdf"
+        "compressed-target.pdf"
     )
 
+    if best_file:
 
-    run_ghostscript(
-        input_pdf=input_pdf,
-        output_pdf=output_pdf,
-        dpi=settings["dpi"],
-        jpeg_quality=settings["quality"]
-    )
+        shutil.copy2(
+            best_file,
+            final_file
+        )
 
-
-    original_size = get_file_size(
-        input_pdf
-    )
-
-    compressed_size = get_file_size(
-        output_pdf
-    )
-
-
-    # Do not return a larger file
-    if compressed_size >= original_size:
+    else:
 
         shutil.copy2(
             input_pdf,
-            output_pdf
+            final_file
         )
 
-        compressed_size = original_size
-
-
-    return output_pdf
+    return final_file, False, "maximum"
 
 
 # =========================================================
-# TARGET SIZE COMPRESSION
+# STANDARD TARGET COMPRESSION
 # =========================================================
 
-def compress_to_target(
+def compress_standard_target(
     input_pdf,
     job_folder,
     target_kb
 ):
 
-    """
-    Try progressively stronger compression until the target
-    is reached.
-
-    Returns:
-        output_path
-        target_reached
-    """
-
-
-    target_bytes = (
-        int(target_kb) * 1024
-    )
-
+    target_bytes = target_kb * 1024
 
     original_size = get_file_size(
         input_pdf
     )
-
-
-    # -----------------------------------------------------
-    # Original already meets target
-    # -----------------------------------------------------
 
     if original_size <= target_bytes:
 
@@ -625,42 +630,39 @@ def compress_to_target(
             output_pdf
         )
 
-        return output_pdf, True
+        return output_pdf, True, "original"
 
 
-    profiles = get_target_profiles(
+    profiles = get_standard_profiles(
         target_kb
     )
 
-
     best_file = None
-
     best_size = original_size
 
+    start_time = time.time()
 
-    # =====================================================
-    # TRY EACH PROFILE
-    # =====================================================
 
-    for attempt_number, profile in enumerate(
+    for index, profile in enumerate(
         profiles,
         start=1
     ):
 
+        if time.time() - start_time > 170:
+            break
+
         dpi, quality = profile
 
-
-        attempt_file = os.path.join(
+        output_file = os.path.join(
             job_folder,
-            f"attempt-{attempt_number}.pdf"
+            f"target-{index}.pdf"
         )
-
 
         try:
 
             run_ghostscript(
-                input_pdf=input_pdf,
-                output_pdf=attempt_file,
+                input_pdf,
+                output_file,
                 dpi=dpi,
                 jpeg_quality=quality
             )
@@ -670,51 +672,39 @@ def compress_to_target(
             continue
 
 
-        attempt_size = get_file_size(
-            attempt_file
+        size = get_file_size(
+            output_file
         )
 
 
-        if attempt_size <= 0:
-
+        if size <= 0:
             continue
 
 
-        # -------------------------------------------------
-        # Remember smallest result
-        # -------------------------------------------------
+        if size < best_size:
 
-        if attempt_size < best_size:
-
-            best_size = attempt_size
-
-            best_file = attempt_file
+            best_size = size
+            best_file = output_file
 
 
-        # -------------------------------------------------
-        # TARGET REACHED
-        # -------------------------------------------------
-
-        if attempt_size <= target_bytes:
+        if size <= target_bytes:
 
             final_file = os.path.join(
                 job_folder,
                 "compressed-target.pdf"
             )
 
-
             shutil.copy2(
-                attempt_file,
+                output_file,
                 final_file
             )
 
+            return (
+                final_file,
+                True,
+                "standard"
+            )
 
-            return final_file, True
-
-
-    # =====================================================
-    # TARGET NOT REACHED
-    # =====================================================
 
     final_file = os.path.join(
         job_folder,
@@ -737,11 +727,129 @@ def compress_to_target(
         )
 
 
-    return final_file, False
+    return final_file, False, "maximum"
 
 
 # =========================================================
-# COMPRESS PDF ENDPOINT
+# TARGET ROUTER
+# =========================================================
+
+def compress_to_target(
+    input_pdf,
+    job_folder,
+    target_kb
+):
+
+    target_bytes = (
+        target_kb * 1024
+    )
+
+    original_size = get_file_size(
+        input_pdf
+    )
+
+
+    # Already below target
+    if original_size <= target_bytes:
+
+        output_pdf = os.path.join(
+            job_folder,
+            "compressed-target.pdf"
+        )
+
+        shutil.copy2(
+            input_pdf,
+            output_pdf
+        )
+
+        return (
+            output_pdf,
+            True,
+            "original"
+        )
+
+
+    # =====================================================
+    # SPECIAL 100 KB MODE
+    # =====================================================
+
+    if target_kb <= 100:
+
+        return compress_to_100kb(
+            input_pdf,
+            job_folder,
+            target_bytes
+        )
+
+
+    # =====================================================
+    # OTHER TARGETS
+    # =====================================================
+
+    return compress_standard_target(
+        input_pdf,
+        job_folder,
+        target_kb
+    )
+
+
+# =========================================================
+# LEVEL COMPRESSION
+# =========================================================
+
+def compress_by_level(
+    input_pdf,
+    job_folder,
+    level
+):
+
+    settings = LEVEL_SETTINGS.get(
+        level
+    )
+
+    if settings is None:
+
+        raise ValueError(
+            "Invalid compression level."
+        )
+
+
+    output_pdf = os.path.join(
+        job_folder,
+        f"compressed-{level}.pdf"
+    )
+
+
+    run_ghostscript(
+        input_pdf,
+        output_pdf,
+        dpi=settings["dpi"],
+        jpeg_quality=settings["quality"]
+    )
+
+
+    original_size = get_file_size(
+        input_pdf
+    )
+
+    compressed_size = get_file_size(
+        output_pdf
+    )
+
+
+    if compressed_size >= original_size:
+
+        shutil.copy2(
+            input_pdf,
+            output_pdf
+        )
+
+
+    return output_pdf
+
+
+# =========================================================
+# MAIN COMPRESS ENDPOINT
 # =========================================================
 
 @app.route(
@@ -750,16 +858,12 @@ def compress_to_target(
 )
 def compress_pdf():
 
-    job_id = str(
-        uuid.uuid4()
-    )
-
+    job_id = str(uuid.uuid4())
 
     job_folder = os.path.join(
         BASE_FOLDER,
         job_id
     )
-
 
     os.makedirs(
         job_folder,
@@ -770,7 +874,7 @@ def compress_pdf():
     try:
 
         # =================================================
-        # FILE CHECK
+        # UPLOAD CHECK
         # =================================================
 
         if "file" not in request.files:
@@ -782,7 +886,7 @@ def compress_pdf():
 
             return jsonify({
                 "success": False,
-                "error": "No PDF file was uploaded."
+                "error": "No PDF file uploaded."
             }), 400
 
 
@@ -790,9 +894,8 @@ def compress_pdf():
 
 
         if (
-            uploaded_file is None or
-            uploaded_file.filename is None or
-            uploaded_file.filename.strip() == ""
+            uploaded_file is None
+            or not uploaded_file.filename
         ):
 
             shutil.rmtree(
@@ -827,14 +930,13 @@ def compress_pdf():
 
 
         # =================================================
-        # SAVE UPLOAD
+        # SAVE FILE
         # =================================================
 
         input_pdf = os.path.join(
             job_folder,
             "input.pdf"
         )
-
 
         uploaded_file.save(
             input_pdf
@@ -860,7 +962,7 @@ def compress_pdf():
 
 
         # =================================================
-        # FILE SIGNATURE
+        # VALIDATE PDF
         # =================================================
 
         if not is_pdf_file(
@@ -874,13 +976,9 @@ def compress_pdf():
 
             return jsonify({
                 "success": False,
-                "error": "The uploaded file is not a valid PDF."
+                "error": "Invalid PDF file."
             }), 400
 
-
-        # =================================================
-        # GHOSTSCRIPT VALIDATION
-        # =================================================
 
         if not validate_pdf_with_ghostscript(
             input_pdf
@@ -894,7 +992,7 @@ def compress_pdf():
             return jsonify({
                 "success": False,
                 "error": (
-                    "The PDF appears to be corrupted "
+                    "The PDF appears corrupted "
                     "or unsupported."
                 )
             }), 400
@@ -911,8 +1009,8 @@ def compress_pdf():
 
 
         target_reached = False
-
         target_kb = None
+        compression_mode = "standard"
 
 
         # =================================================
@@ -971,17 +1069,19 @@ def compress_pdf():
                 return jsonify({
                     "success": False,
                     "error": (
-                        "Maximum target size is 20480 KB."
+                        "Maximum target is 20480 KB."
                     )
                 }), 400
 
 
-            output_pdf, target_reached = (
-                compress_to_target(
-                    input_pdf=input_pdf,
-                    job_folder=job_folder,
-                    target_kb=target_kb
-                )
+            (
+                output_pdf,
+                target_reached,
+                compression_mode
+            ) = compress_to_target(
+                input_pdf,
+                job_folder,
+                target_kb
             )
 
 
@@ -1011,17 +1111,18 @@ def compress_pdf():
                 return jsonify({
                     "success": False,
                     "error": (
-                        "Compression level must be "
-                        "low, recommended or high."
+                        "Invalid compression level."
                     )
                 }), 400
 
 
             output_pdf = compress_by_level(
-                input_pdf=input_pdf,
-                job_folder=job_folder,
-                level=level
+                input_pdf,
+                job_folder,
+                level
             )
+
+            compression_mode = level
 
 
         else:
@@ -1040,17 +1141,8 @@ def compress_pdf():
 
 
         # =================================================
-        # FINAL FILE CHECK
+        # FINAL SIZE
         # =================================================
-
-        if not os.path.exists(
-            output_pdf
-        ):
-
-            raise RuntimeError(
-                "Compressed PDF was not created."
-            )
-
 
         compressed_size = get_file_size(
             output_pdf
@@ -1065,7 +1157,7 @@ def compress_pdf():
 
 
         # =================================================
-        # NEVER RETURN A FILE BIGGER THAN ORIGINAL
+        # NEVER RETURN LARGER RESULT
         # =================================================
 
         if compressed_size > original_size:
@@ -1078,27 +1170,33 @@ def compress_pdf():
             compressed_size = original_size
 
 
-            if (
-                mode == "target" and
-                original_size <= target_kb * 1024
-            ):
+        # =================================================
+        # RECHECK TARGET
+        # =================================================
 
-                target_reached = True
+        if (
+            mode == "target"
+            and target_kb is not None
+        ):
+
+            target_reached = (
+                compressed_size
+                <= target_kb * 1024
+            )
 
 
         # =================================================
-        # CALCULATE REDUCTION
+        # REDUCTION
         # =================================================
 
         if original_size > 0:
 
             reduction_percent = (
                 (
-                    original_size -
-                    compressed_size
+                    original_size
+                    - compressed_size
                 )
-                /
-                original_size
+                / original_size
             ) * 100
 
         else:
@@ -1127,7 +1225,7 @@ def compress_pdf():
 
 
         # =================================================
-        # SEND FILE
+        # RESPONSE
         # =================================================
 
         response = send_file(
@@ -1138,29 +1236,24 @@ def compress_pdf():
         )
 
 
-        # =================================================
-        # CUSTOM HEADERS
-        # =================================================
-
         response.headers[
             "X-Original-Size"
-        ] = str(
-            original_size
-        )
+        ] = str(original_size)
 
 
         response.headers[
             "X-Compressed-Size"
-        ] = str(
-            compressed_size
-        )
+        ] = str(compressed_size)
 
 
         response.headers[
             "X-Reduction-Percent"
-        ] = (
-            f"{reduction_percent:.1f}"
-        )
+        ] = f"{reduction_percent:.1f}"
+
+
+        response.headers[
+            "X-Compression-Mode"
+        ] = compression_mode
 
 
         if mode == "target":
@@ -1176,13 +1269,11 @@ def compress_pdf():
 
             response.headers[
                 "X-Target-KB"
-            ] = str(
-                target_kb
-            )
+            ] = str(target_kb)
 
 
         # =================================================
-        # CLEAN TEMP FILES AFTER RESPONSE
+        # CLEANUP
         # =================================================
 
         @response.call_on_close
@@ -1211,14 +1302,14 @@ def compress_pdf():
         return jsonify({
             "success": False,
             "error": (
-                "PDF compression took too long. "
+                "Compression took too long. "
                 "Please try a smaller PDF."
             )
         }), 504
 
 
     # =====================================================
-    # OTHER ERROR
+    # GENERAL ERROR
     # =====================================================
 
     except Exception as error:
@@ -1229,12 +1320,10 @@ def compress_pdf():
             flush=True
         )
 
-
         shutil.rmtree(
             job_folder,
             ignore_errors=True
         )
-
 
         return jsonify({
             "success": False,
@@ -1246,7 +1335,7 @@ def compress_pdf():
 
 
 # =========================================================
-# RUN LOCALLY
+# LOCAL RUN
 # =========================================================
 
 if __name__ == "__main__":
@@ -1257,7 +1346,6 @@ if __name__ == "__main__":
             10000
         )
     )
-
 
     app.run(
         host="0.0.0.0",
