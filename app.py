@@ -1,7 +1,6 @@
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
 
@@ -11,16 +10,15 @@ from werkzeug.utils import secure_filename
 
 
 # =========================================================
-# APP
+# FLASK APP
 # =========================================================
 
 app = Flask(__name__)
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
+BASE_FOLDER = "/tmp/pdf_compressor"
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
-
-BASE_FOLDER = "/tmp/pdf_compressor"
 
 os.makedirs(BASE_FOLDER, exist_ok=True)
 
@@ -64,80 +62,42 @@ def add_security_headers(response):
 
 
 # =========================================================
-# COMPRESSION LEVELS
+# COMPRESSION LEVEL PROFILES
 #
-# LOW
-# Better image quality
-# Less compression
+# LOW:
+# Better quality, lighter compression
 #
-# RECOMMENDED
-# Balanced quality and file size
+# RECOMMENDED:
+# Balanced quality and size
 #
-# HIGH
-# Strong compression
-# Smaller output
+# HIGH:
+# Stronger compression
 # =========================================================
 
-LEVEL_SETTINGS = {
+LEVEL_PROFILES = {
 
     "low": [
-        {
-            "dpi": 180,
-            "quality": 85,
-            "grayscale": False
-        },
-        {
-            "dpi": 160,
-            "quality": 78,
-            "grayscale": False
-        }
+        (150, 75),
+        (135, 68)
     ],
 
     "recommended": [
-        {
-            "dpi": 140,
-            "quality": 70,
-            "grayscale": False
-        },
-        {
-            "dpi": 120,
-            "quality": 60,
-            "grayscale": False
-        },
-        {
-            "dpi": 105,
-            "quality": 52,
-            "grayscale": False
-        }
+        (120, 60),
+        (105, 52),
+        (95, 46)
     ],
 
     "high": [
-        {
-            "dpi": 100,
-            "quality": 48,
-            "grayscale": False
-        },
-        {
-            "dpi": 85,
-            "quality": 38,
-            "grayscale": False
-        },
-        {
-            "dpi": 72,
-            "quality": 30,
-            "grayscale": False
-        },
-        {
-            "dpi": 60,
-            "quality": 24,
-            "grayscale": False
-        }
+        (90, 42),
+        (80, 35),
+        (72, 28),
+        (60, 22)
     ]
 }
 
 
 # =========================================================
-# TARGET COMPRESSION PROFILES
+# NORMAL TARGET SIZE PROFILES
 # =========================================================
 
 TARGET_PROFILES = [
@@ -159,7 +119,7 @@ TARGET_PROFILES = [
 
 
 # =========================================================
-# SPECIAL STRONG 100 KB PROFILES
+# STRONG 100 KB COLOR PROFILES
 # =========================================================
 
 COLOR_100KB_PROFILES = [
@@ -176,6 +136,10 @@ COLOR_100KB_PROFILES = [
     (25, 8)
 ]
 
+
+# =========================================================
+# STRONG 100 KB GRAYSCALE FALLBACK
+# =========================================================
 
 GRAYSCALE_100KB_PROFILES = [
 
@@ -223,14 +187,14 @@ def calculate_reduction(original_size, compressed_size):
 
 def is_pdf(filename):
 
-    return (
+    return bool(
         filename and
         filename.lower().endswith(".pdf")
     )
 
 
 # =========================================================
-# GHOSTSCRIPT
+# GHOSTSCRIPT COMPRESSION
 # =========================================================
 
 def run_ghostscript(
@@ -255,9 +219,10 @@ def run_ghostscript(
 
         "-dCompatibilityLevel=1.4",
 
+        # Duplicate images
         "-dDetectDuplicateImages=true",
 
-        # Force JPEG / JPX images to be processed
+        # Force JPEG / JPX processing
         "-dPassThroughJPEGImages=false",
         "-dPassThroughJPXImages=false",
 
@@ -280,7 +245,7 @@ def run_ghostscript(
         "-dAutoFilterColorImages=false",
         "-dColorImageFilter=/DCTEncode",
 
-        # Gray images
+        # Grayscale images
         "-dDownsampleGrayImages=true",
         "-dGrayImageDownsampleType=/Bicubic",
 
@@ -289,7 +254,7 @@ def run_ghostscript(
         "-dAutoFilterGrayImages=false",
         "-dGrayImageFilter=/DCTEncode",
 
-        # Mono images
+        # Monochrome images
         "-dDownsampleMonoImages=true",
         "-dMonoImageDownsampleType=/Subsample",
 
@@ -305,7 +270,6 @@ def run_ghostscript(
         command.extend([
 
             "-sColorConversionStrategy=Gray",
-
             "-dProcessColorModel=/DeviceGray"
 
         ])
@@ -314,44 +278,48 @@ def run_ghostscript(
     command.extend([
 
         f"-sOutputFile={output_pdf}",
-
         input_pdf
 
     ])
 
 
     process = subprocess.run(
+
         command,
+
         stdout=subprocess.PIPE,
+
         stderr=subprocess.PIPE,
+
         timeout=90
+
     )
 
 
     if process.returncode != 0:
 
-        error_text = process.stderr.decode(
+        error_message = process.stderr.decode(
             "utf-8",
             errors="ignore"
         )
 
         raise RuntimeError(
-            "Ghostscript compression failed: " +
-            error_text
+            "Ghostscript failed: " +
+            error_message
         )
 
 
     if not os.path.exists(output_pdf):
 
         raise RuntimeError(
-            "Ghostscript did not create output PDF."
+            "Ghostscript did not create output."
         )
 
 
     if os.path.getsize(output_pdf) <= 0:
 
         raise RuntimeError(
-            "Ghostscript created an empty PDF."
+            "Ghostscript created empty PDF."
         )
 
 
@@ -365,13 +333,15 @@ def compress_by_level(
     level
 ):
 
-    profiles = LEVEL_SETTINGS.get(level)
+    profiles = LEVEL_PROFILES.get(level)
 
     if not profiles:
 
-        level = "recommended"
+        profiles = LEVEL_PROFILES[
+            "recommended"
+        ]
 
-        profiles = LEVEL_SETTINGS["recommended"]
+        level = "recommended"
 
 
     original_size = get_file_size(
@@ -380,18 +350,37 @@ def compress_by_level(
 
 
     best_file = None
-
     best_size = original_size
 
 
-    for index, settings in enumerate(
+    print(
+        f"Compression level selected: {level}",
+        flush=True
+    )
+
+
+    for index, (
+        dpi,
+        quality
+    ) in enumerate(
         profiles,
         start=1
     ):
 
         output_file = os.path.join(
+
             job_folder,
-            f"level-{level}-{index}.pdf"
+
+            f"{level}-{index}.pdf"
+
+        )
+
+
+        print(
+            f"Trying {level}: "
+            f"DPI={dpi}, "
+            f"Quality={quality}",
+            flush=True
         )
 
 
@@ -399,49 +388,56 @@ def compress_by_level(
 
             run_ghostscript(
 
-                input_pdf,
+                input_pdf=input_pdf,
 
-                output_file,
+                output_pdf=output_file,
 
-                dpi=settings["dpi"],
+                dpi=dpi,
 
-                jpeg_quality=settings["quality"],
+                jpeg_quality=quality,
 
-                grayscale=settings.get(
-                    "grayscale",
-                    False
-                )
+                grayscale=False
 
             )
+
 
         except Exception as exc:
 
             print(
-                f"Level compression attempt failed: {exc}",
+                f"{level} attempt failed: {exc}",
                 flush=True
             )
 
             continue
 
 
-        output_size = get_file_size(
+        current_size = get_file_size(
             output_file
         )
 
 
+        print(
+            f"{level} result: "
+            f"{current_size} bytes",
+            flush=True
+        )
+
+
         if (
-            output_size > 0 and
-            output_size < best_size
+            current_size > 0 and
+            current_size < best_size
         ):
 
+            best_size = current_size
             best_file = output_file
-
-            best_size = output_size
 
 
     final_file = os.path.join(
+
         job_folder,
+
         f"compressed-{level}.pdf"
+
     )
 
 
@@ -454,7 +450,9 @@ def compress_by_level(
 
     else:
 
-        # Do not return a file larger than original
+        # PDF may already be highly optimized.
+        # Never return a file larger than original.
+
         shutil.copy2(
             input_pdf,
             final_file
@@ -465,7 +463,7 @@ def compress_by_level(
 
 
 # =========================================================
-# NORMAL TARGET COMPRESSION
+# TARGET SIZE COMPRESSION
 # =========================================================
 
 def compress_to_target(
@@ -484,7 +482,7 @@ def compress_to_target(
     )
 
 
-    # Already smaller than requested target
+    # Already smaller than target
     if original_size <= target_bytes:
 
         output_file = os.path.join(
@@ -497,27 +495,26 @@ def compress_to_target(
             output_file
         )
 
-        return (
-            output_file,
-            True
-        )
+        return output_file, True
 
 
     best_file = None
-
     best_size = original_size
-
 
     start_time = time.time()
 
 
     # =====================================================
-    # SPECIAL 100 KB MODE
+    # SPECIAL <= 100 KB COMPRESSION
     # =====================================================
 
     if target_kb <= 100:
 
-        # First try COLOR
+
+        # -----------------------------
+        # COLOR MODE FIRST
+        # -----------------------------
+
         for index, (
             dpi,
             quality
@@ -526,14 +523,20 @@ def compress_to_target(
             start=1
         ):
 
-            # Safety time limit
-            if time.time() - start_time > 150:
+            if (
+                time.time() -
+                start_time >
+                150
+            ):
                 break
 
 
             output_file = os.path.join(
+
                 job_folder,
+
                 f"target-color-{index}.pdf"
+
             )
 
 
@@ -545,18 +548,20 @@ def compress_to_target(
 
                     output_file,
 
-                    dpi=dpi,
+                    dpi,
 
-                    jpeg_quality=quality,
+                    quality,
 
-                    grayscale=False
+                    False
 
                 )
+
 
             except Exception as exc:
 
                 print(
-                    f"100KB color attempt failed: {exc}",
+                    "100KB color compression "
+                    f"failed: {exc}",
                     flush=True
                 )
 
@@ -574,7 +579,6 @@ def compress_to_target(
             ):
 
                 best_file = output_file
-
                 best_size = current_size
 
 
@@ -584,8 +588,11 @@ def compress_to_target(
             ):
 
                 final_file = os.path.join(
+
                     job_folder,
+
                     "compressed-target.pdf"
+
                 )
 
                 shutil.copy2(
@@ -593,15 +600,12 @@ def compress_to_target(
                     final_file
                 )
 
-                return (
-                    final_file,
-                    True
-                )
+                return final_file, True
 
 
-        # =================================================
+        # -----------------------------
         # GRAYSCALE FALLBACK
-        # =================================================
+        # -----------------------------
 
         for index, (
             dpi,
@@ -611,13 +615,20 @@ def compress_to_target(
             start=1
         ):
 
-            if time.time() - start_time > 175:
+            if (
+                time.time() -
+                start_time >
+                175
+            ):
                 break
 
 
             output_file = os.path.join(
+
                 job_folder,
+
                 f"target-gray-{index}.pdf"
+
             )
 
 
@@ -629,18 +640,20 @@ def compress_to_target(
 
                     output_file,
 
-                    dpi=dpi,
+                    dpi,
 
-                    jpeg_quality=quality,
+                    quality,
 
-                    grayscale=True
+                    True
 
                 )
+
 
             except Exception as exc:
 
                 print(
-                    f"100KB grayscale attempt failed: {exc}",
+                    "100KB grayscale "
+                    f"compression failed: {exc}",
                     flush=True
                 )
 
@@ -658,7 +671,6 @@ def compress_to_target(
             ):
 
                 best_file = output_file
-
                 best_size = current_size
 
 
@@ -668,8 +680,11 @@ def compress_to_target(
             ):
 
                 final_file = os.path.join(
+
                     job_folder,
+
                     "compressed-target.pdf"
+
                 )
 
                 shutil.copy2(
@@ -677,14 +692,11 @@ def compress_to_target(
                     final_file
                 )
 
-                return (
-                    final_file,
-                    True
-                )
+                return final_file, True
 
 
     # =====================================================
-    # 200 KB / 500 KB / 1 MB / CUSTOM
+    # 200 KB / 500 KB / 1MB / CUSTOM
     # =====================================================
 
     else:
@@ -697,13 +709,20 @@ def compress_to_target(
             start=1
         ):
 
-            if time.time() - start_time > 175:
+            if (
+                time.time() -
+                start_time >
+                175
+            ):
                 break
 
 
             output_file = os.path.join(
+
                 job_folder,
+
                 f"target-{index}.pdf"
+
             )
 
 
@@ -715,18 +734,20 @@ def compress_to_target(
 
                     output_file,
 
-                    dpi=dpi,
+                    dpi,
 
-                    jpeg_quality=quality,
+                    quality,
 
-                    grayscale=False
+                    False
 
                 )
+
 
             except Exception as exc:
 
                 print(
-                    f"Target attempt failed: {exc}",
+                    "Target compression "
+                    f"failed: {exc}",
                     flush=True
                 )
 
@@ -744,7 +765,6 @@ def compress_to_target(
             ):
 
                 best_file = output_file
-
                 best_size = current_size
 
 
@@ -754,8 +774,11 @@ def compress_to_target(
             ):
 
                 final_file = os.path.join(
+
                     job_folder,
+
                     "compressed-target.pdf"
+
                 )
 
                 shutil.copy2(
@@ -763,20 +786,19 @@ def compress_to_target(
                     final_file
                 )
 
-                return (
-                    final_file,
-                    True
-                )
+                return final_file, True
 
 
     # =====================================================
-    # TARGET COULD NOT BE REACHED
-    # Return smallest result found
+    # TARGET NOT REACHED
     # =====================================================
 
     final_file = os.path.join(
+
         job_folder,
+
         "compressed-target.pdf"
+
     )
 
 
@@ -800,19 +822,20 @@ def compress_to_target(
     )
 
 
-    reached = (
-        final_size <= target_bytes
+    target_reached = (
+        final_size <=
+        target_bytes
     )
 
 
     return (
         final_file,
-        reached
+        target_reached
     )
 
 
 # =========================================================
-# ROOT
+# HOME
 # =========================================================
 
 @app.route("/", methods=["GET"])
@@ -824,11 +847,12 @@ def home():
 
         "status": "online",
 
-        "service": "TeluguTech777 PDF Compressor",
+        "service":
+            "TeluguTech777 PDF Compressor",
 
         "features": [
 
-            "Compress PDF",
+            "PDF compression",
 
             "100 KB target",
 
@@ -860,9 +884,12 @@ def health():
 
     try:
 
-        result = subprocess.run(
+        process = subprocess.run(
 
-            ["gs", "--version"],
+            [
+                "gs",
+                "--version"
+            ],
 
             stdout=subprocess.PIPE,
 
@@ -876,21 +903,24 @@ def health():
 
 
         installed = (
-            result.returncode == 0
+            process.returncode == 0
         )
 
 
         version = (
-            result.stdout.strip()
+
+            process.stdout.strip()
+
             if installed
+
             else None
+
         )
 
 
     except Exception:
 
         installed = False
-
         version = None
 
 
@@ -912,7 +942,7 @@ def health():
 
 
 # =========================================================
-# COMPRESS PDF
+# COMPRESS API
 # =========================================================
 
 @app.route(
@@ -927,7 +957,7 @@ def compress_pdf():
     try:
 
         # =================================================
-        # FILE VALIDATION
+        # CHECK FILE
         # =================================================
 
         if "file" not in request.files:
@@ -936,7 +966,8 @@ def compress_pdf():
 
                 "success": False,
 
-                "error": "No PDF file uploaded."
+                "error":
+                    "No PDF file uploaded."
 
             }), 400
 
@@ -955,7 +986,8 @@ def compress_pdf():
 
                 "success": False,
 
-                "error": "No PDF file selected."
+                "error":
+                    "No PDF selected."
 
             }), 400
 
@@ -971,13 +1003,14 @@ def compress_pdf():
 
                 "success": False,
 
-                "error": "Only PDF files are allowed."
+                "error":
+                    "Only PDF files are allowed."
 
             }), 400
 
 
         # =================================================
-        # CREATE TEMP JOB
+        # CREATE JOB
         # =================================================
 
         job_id = str(
@@ -986,8 +1019,11 @@ def compress_pdf():
 
 
         job_folder = os.path.join(
+
             BASE_FOLDER,
+
             job_id
+
         )
 
 
@@ -998,8 +1034,11 @@ def compress_pdf():
 
 
         input_pdf = os.path.join(
+
             job_folder,
+
             "input.pdf"
+
         )
 
 
@@ -1026,15 +1065,14 @@ def compress_pdf():
 
                 "success": False,
 
-                "error": (
-                    "Maximum PDF size is 25 MB."
-                )
+                "error":
+                    "Maximum file size is 25 MB."
 
             }), 413
 
 
         # =================================================
-        # MODE
+        # GET MODE
         # =================================================
 
         mode = request.form.get(
@@ -1042,7 +1080,16 @@ def compress_pdf():
             "target"
         )
 
-        mode = mode.strip().lower()
+
+        mode = (
+            mode.strip().lower()
+        )
+
+
+        print(
+            f"Requested mode: {mode}",
+            flush=True
+        )
 
 
         if mode not in [
@@ -1054,22 +1101,19 @@ def compress_pdf():
 
                 "success": False,
 
-                "error": (
+                "error":
                     "Invalid compression mode."
-                )
 
             }), 400
 
 
         target_reached = None
-
         target_kb = None
-
         level = None
 
 
         # =================================================
-        # TARGET SIZE MODE
+        # TARGET MODE
         # =================================================
 
         if mode == "target":
@@ -1092,9 +1136,8 @@ def compress_pdf():
 
                     "success": False,
 
-                    "error": (
+                    "error":
                         "Invalid target size."
-                    )
 
                 }), 400
 
@@ -1108,25 +1151,31 @@ def compress_pdf():
 
                     "success": False,
 
-                    "error": (
-                        "Target size must be "
-                        "between 50 KB and "
-                        "20480 KB."
-                    )
+                    "error":
+                        "Target must be between "
+                        "50 KB and 20480 KB."
 
                 }), 400
 
 
-            output_pdf, target_reached = (
-                compress_to_target(
+            print(
+                f"Target selected: {target_kb} KB",
+                flush=True
+            )
 
-                    input_pdf,
 
-                    job_folder,
+            (
+                output_pdf,
+                target_reached
 
-                    target_kb
+            ) = compress_to_target(
 
-                )
+                input_pdf,
+
+                job_folder,
+
+                target_kb
+
             )
 
 
@@ -1147,19 +1196,28 @@ def compress_pdf():
             )
 
 
+            print(
+                f"Level received: {level}",
+                flush=True
+            )
+
+
             if level not in [
+
                 "low",
+
                 "recommended",
+
                 "high"
+
             ]:
 
                 return jsonify({
 
                     "success": False,
 
-                    "error": (
+                    "error":
                         "Invalid compression level."
-                    )
 
                 }), 400
 
@@ -1176,7 +1234,7 @@ def compress_pdf():
 
 
         # =================================================
-        # OUTPUT
+        # RESULT SIZE
         # =================================================
 
         compressed_size = get_file_size(
@@ -1187,11 +1245,11 @@ def compress_pdf():
         if compressed_size <= 0:
 
             raise RuntimeError(
-                "Compressed PDF was not created."
+                "Compressed PDF not created."
             )
 
 
-        # Never send a larger output file.
+        # Never return bigger PDF
         if compressed_size > original_size:
 
             shutil.copy2(
@@ -1199,9 +1257,7 @@ def compress_pdf():
                 output_pdf
             )
 
-            compressed_size = (
-                original_size
-            )
+            compressed_size = original_size
 
 
         reduction_percent = (
@@ -1215,12 +1271,39 @@ def compress_pdf():
         )
 
 
+        print(
+            "Original size: "
+            f"{original_size}",
+            flush=True
+        )
+
+
+        print(
+            "Compressed size: "
+            f"{compressed_size}",
+            flush=True
+        )
+
+
+        print(
+            "Reduction: "
+            f"{reduction_percent}%",
+            flush=True
+        )
+
+
+        # =================================================
+        # DOWNLOAD FILE
+        # =================================================
+
+        base_name = os.path.splitext(
+            filename
+        )[0]
+
+
         download_name = (
-
-            os.path.splitext(filename)[0]
-            +
+            base_name +
             "-compressed.pdf"
-
         )
 
 
@@ -1240,22 +1323,28 @@ def compress_pdf():
 
 
         # =================================================
-        # RESPONSE HEADERS
+        # HEADERS
         # =================================================
 
         response.headers[
             "X-Original-Size"
-        ] = str(original_size)
+        ] = str(
+            original_size
+        )
 
 
         response.headers[
             "X-Compressed-Size"
-        ] = str(compressed_size)
+        ] = str(
+            compressed_size
+        )
 
 
         response.headers[
             "X-Reduction-Percent"
-        ] = str(reduction_percent)
+        ] = str(
+            reduction_percent
+        )
 
 
         response.headers[
@@ -1268,15 +1357,21 @@ def compress_pdf():
             response.headers[
                 "X-Target-Reached"
             ] = (
+
                 "true"
+
                 if target_reached
+
                 else "false"
+
             )
 
 
             response.headers[
                 "X-Target-KB"
-            ] = str(target_kb)
+            ] = str(
+                target_kb
+            )
 
 
         if mode == "level":
@@ -1287,7 +1382,7 @@ def compress_pdf():
 
 
         # =================================================
-        # CLEANUP AFTER RESPONSE
+        # TEMP FILE CLEANUP
         # =================================================
 
         @response.call_on_close
@@ -1303,13 +1398,18 @@ def compress_pdf():
             except Exception as exc:
 
                 print(
-                    f"Cleanup error: {exc}",
+                    "Cleanup error: "
+                    f"{exc}",
                     flush=True
                 )
 
 
         return response
 
+
+    # =====================================================
+    # TIMEOUT
+    # =====================================================
 
     except subprocess.TimeoutExpired:
 
@@ -1325,18 +1425,22 @@ def compress_pdf():
 
             "success": False,
 
-            "error": (
+            "error":
                 "PDF compression timed out. "
-                "Please try a smaller PDF."
-            )
+                "Please try again."
 
         }), 504
 
 
+    # =====================================================
+    # OTHER ERRORS
+    # =====================================================
+
     except Exception as exc:
 
         print(
-            f"Compression error: {exc}",
+            "Compression error: "
+            f"{exc}",
             flush=True
         )
 
@@ -1353,15 +1457,14 @@ def compress_pdf():
 
             "success": False,
 
-            "error": (
+            "error":
                 "Unable to compress PDF."
-            )
 
         }), 500
 
 
 # =========================================================
-# 413 FILE TOO LARGE
+# FILE TOO LARGE
 # =========================================================
 
 @app.errorhandler(413)
@@ -1371,10 +1474,8 @@ def file_too_large(error):
 
         "success": False,
 
-        "error": (
-            "PDF is too large. "
-            "Maximum upload size is 25 MB."
-        )
+        "error":
+            "Maximum PDF upload size is 25 MB."
 
     }), 413
 
@@ -1384,13 +1485,14 @@ def file_too_large(error):
 # =========================================================
 
 @app.errorhandler(404)
-def not_found(error):
+def page_not_found(error):
 
     return jsonify({
 
         "success": False,
 
-        "error": "Endpoint not found."
+        "error":
+            "Endpoint not found."
 
     }), 404
 
@@ -1400,19 +1502,20 @@ def not_found(error):
 # =========================================================
 
 @app.errorhandler(500)
-def internal_error(error):
+def server_error(error):
 
     return jsonify({
 
         "success": False,
 
-        "error": "Internal server error."
+        "error":
+            "Internal server error."
 
     }), 500
 
 
 # =========================================================
-# LOCAL DEVELOPMENT
+# LOCAL RUN
 # =========================================================
 
 if __name__ == "__main__":
